@@ -28,6 +28,15 @@ panel ppi      = panel pixels / physical inches  (sharpness of the glass, inform
 The effective DPI does not change with browser zoom (zoom changes the DPR and the CSS ppi, not
 the device pixels per inch), so it is the number to store.
 
+### A note on the term
+
+"Effective DPI" is not an established term, and on Windows it means nearly the opposite: there,
+`MDT_EFFECTIVE_DPI` is the *scaled, logical* value (96 × the scale factor, e.g. 120 at 125%),
+while the physical one is `MDT_RAW_DPI`. Here the effective DPI always means **how many device
+pixels are drawn per real inch of glass**. It is closer to the "effective ppi" of print layout
+(how many pixels of an image fall on one inch at the final printed size). Strictly, screens have
+ppi and printers dpi; the tool keeps the name it has.
+
 ### Drawn pixels are not panel pixels
 
 With fractional scaling, what an application draws can differ from what the panel shows, and
