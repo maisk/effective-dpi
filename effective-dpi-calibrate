@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""effective-dpi-calibrate: fine-tune the effective DPI against a real bank card (X11, XWayland).
+
+Draws an ID-1 card outline (85.60 × 53.98 mm) at the size effective-dpi predicts for the
+monitor the window is on. Hold a real card against the glass and grow or shrink the outline
+until the two match: the result is the calibrated effective DPI, saved per monitor.
+On Wayland Tk runs under XWayland, so it asks effective-dpi for XWayland's pixels.
+"""
+import argparse
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import messagebox
+
+CARD_MM = (85.60, 53.98)                    # ISO/IEC 7810 ID-1
+CORNER_MM = 3.18
+MM_PER_IN = 25.4
+TOLERANCE = 0.025                           # IHE mammography display test: within 2.5%
+CAL_FILE = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+                        'effective-dpi', 'calibration.json')
+COLOR = '#e07000'
+
+
+def effective_dpi_rows():
+    """Every active monitor, as `effective-dpi --all --json` describes it, in X pixels."""
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'effective-dpi')
+    if not os.path.isfile(tool):
+        tool = shutil.which('effective-dpi')
+    if not tool:
+        sys.exit('effective-dpi-calibrate: effective-dpi not found next to this script or in PATH')
+    p = subprocess.run([sys.executable, tool, '--all', '--json', '--no-calibration',
+                        '--client', 'xwayland'],             # ignored on X11
+                       capture_output=True, text=True)
+    if p.returncode:
+        sys.exit(p.stderr.strip() or 'effective-dpi-calibrate: effective-dpi failed')
+    return json.loads(p.stdout)
+
+
+def key(r):
+    """A monitor's identity: the output plus what the EDID says it is."""
+    return '|'.join(str(r.get(k) or '') for k in ('output', 'maker', 'name'))
+
+
+def contains(r, x, y):
+    (w, h), (px, py) = r['drawn_px'], r['position']
+    return px <= x < px + w and py <= y < py + h
+
+
+def load_cal():
+    try:
+        with open(CAL_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cal(cal):
+    os.makedirs(os.path.dirname(CAL_FILE), exist_ok=True)
+    tmp = CAL_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(cal, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+    os.replace(tmp, CAL_FILE)
+
+
+def card_outline(c, x0, y0, x1, y1, rx, ry, **kw):
+    """A rounded rectangle: four quarter arcs and four straight edges."""
+    for ax, ay, start in ((x1 - 2 * rx, y0, 0), (x0, y0, 90),
+                          (x0, y1 - 2 * ry, 180), (x1 - 2 * rx, y1 - 2 * ry, 270)):
+        c.create_arc(ax, ay, ax + 2 * rx, ay + 2 * ry, start=start, extent=90, style='arc',
+                     outline=kw['fill'], width=kw['width'])
+    for xa, ya, xb, yb in ((x0 + rx, y0, x1 - rx, y0), (x0 + rx, y1, x1 - rx, y1),
+                           (x0, y0 + ry, x0, y1 - ry), (x1, y0 + ry, x1, y1 - ry)):
+        c.create_line(xa, ya, xb, yb, **kw)
+
+
+class Calibrator:
+    STEPS = ((-0.01, '−1%'), (-0.001, '−0.1%'), (0.001, '+0.1%'), (0.01, '+1%'))
+
+    def __init__(self, root, rows):
+        self.root, self.rows, self.cal = root, rows, load_cal()
+        self.state = {}                     # per monitor: dpi [h, v], source, dirty
+        self.mon, self.spans = None, False
+
+        root.title('effective-dpi calibrate')
+        self.canvas = tk.Canvas(root, bg='white', highlightthickness=0)
+        self.canvas.pack(anchor='w')
+        self.info = tk.Label(root, justify='left', anchor='w', font='TkFixedFont')
+        self.info.pack(fill='x', padx=8, pady=(6, 0))
+        self.warn = tk.Label(root, justify='left', anchor='w', fg='#b00020')
+        self.warn.pack(fill='x', padx=8)
+        grid = tk.Frame(root)
+        grid.pack(padx=8, pady=6)
+        for r, (label, axes) in enumerate((('both', (0, 1)), ('width', (0,)), ('height', (1,)))):
+            tk.Label(grid, text=label).grid(row=r, column=0, sticky='w', padx=(0, 8))
+            for c, (f, text) in enumerate(self.STEPS, 1):
+                tk.Button(grid, text=text, width=6,
+                          command=lambda f=f, a=axes: self.nudge(f, a)).grid(row=r, column=c)
+        bar = tk.Frame(root)
+        bar.pack(fill='x', padx=8, pady=(0, 8))
+        tk.Button(bar, text='Save', command=self.save).pack(side='right')
+        tk.Button(bar, text='Reset to EDID', command=self.reset).pack(side='right', padx=6)
+        tk.Label(bar, fg='#555', text='keys: ←/→ width, ↓/↑ height, −/+ both (0.1%); '
+                 'Shift or PgUp/PgDn ×10; Ctrl+S saves; Esc quits').pack(side='left')
+
+        for k, f, axes in (('Left', -1, (0,)), ('Right', 1, (0,)), ('Down', -1, (1,)),
+                           ('Up', 1, (1,)), ('minus', -1, (0, 1)), ('KP_Subtract', -1, (0, 1)),
+                           ('plus', 1, (0, 1)), ('equal', 1, (0, 1)), ('KP_Add', 1, (0, 1))):
+            root.bind(f'<{k}>', lambda e, f=f, a=axes: self.nudge(f * 0.001, a))
+            if k in ('Left', 'Right', 'Down', 'Up'):
+                root.bind(f'<Shift-{k}>', lambda e, f=f, a=axes: self.nudge(f * 0.01, a))
+        root.bind('<Prior>', lambda e: self.nudge(0.01, (0, 1)))
+        root.bind('<Next>', lambda e: self.nudge(-0.01, (0, 1)))
+        for k in ('s', 'S', 'Greek_sigma', 'Greek_SIGMA'):   # Tk sees the Greek layout's keysym
+            root.bind(f'<Control-{k}>', lambda e: self.save())
+        root.bind('<Escape>', lambda e: self.quit())
+        root.protocol('WM_DELETE_WINDOW', self.quit)
+
+        px, py = root.winfo_pointerxy()     # start on the monitor under the pointer
+        mon = next((r for r in rows if contains(r, px, py)), None) or \
+            next((r for r in rows if r['primary']), rows[0])
+        self.select(mon)
+        root.update_idletasks()
+        (mw, mh), (mx, my) = mon['drawn_px'], mon['position']
+        w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+        root.geometry(f'+{mx + max(0, (mw - w) // 2)}+{my + max(0, (mh - h) // 2)}')
+        root.bind('<Configure>', self.on_configure)
+
+    def cur(self):
+        return self.state[key(self.mon)]
+
+    def start_dpi(self, mon):
+        if mon.get('effective_dpi'):
+            return list(mon['effective_dpi']), 'EDID'
+        g = 96 * (mon.get('dpr') or 1)
+        return [g, g], 'a guess (no EDID size): 96 × DPR'
+
+    def select(self, mon):
+        k = key(mon)
+        if k not in self.state:
+            saved = self.cal.get(k)
+            if saved:
+                dpi, src = list(saved['effective_dpi']), f"saved calibration ({saved['saved'][:10]})"
+            else:
+                dpi, src = self.start_dpi(mon)
+            self.state[k] = {'dpi': dpi, 'source': src, 'dirty': False}
+        self.mon = mon
+        dh, dv = self.cur()['dpi']          # card's top-left corner stays here while resizing
+        self.origin = round(dh * 0.3), round(dv * 0.3)
+        self.canvas.config(width=1, height=1)
+        self.redraw()
+
+    def on_configure(self, e):
+        if e.widget is not self.root:
+            return
+        x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        mon = next((r for r in self.rows if contains(r, x + w // 2, y + h // 2)), self.mon)
+        spans = not (contains(mon, x, y) and contains(mon, x + w - 1, y + h - 1))
+        if mon is not self.mon:
+            self.spans = spans
+            self.select(mon)
+        elif spans != self.spans:
+            self.spans = spans
+            self.redraw()
+
+    def nudge(self, f, axes):
+        s = self.cur()
+        for a in axes:
+            s['dpi'][a] *= 1 + f
+        s['source'], s['dirty'] = 'adjusted by hand', True
+        self.redraw()
+
+    def reset(self):
+        s = self.cur()
+        s['dpi'], s['source'] = self.start_dpi(self.mon)
+        s['dirty'] = key(self.mon) in self.cal
+        self.redraw()
+
+    def redraw(self):
+        c, m, s = self.canvas, self.mon, self.cur()
+        dh, dv = s['dpi']
+        w, h = CARD_MM[0] / MM_PER_IN * dh, CARD_MM[1] / MM_PER_IN * dv
+        x0, y0 = self.origin
+        cw, ch = int(c.cget('width')), int(c.cget('height'))
+        if x0 + w + x0 > cw or y0 + h + y0 > ch:    # only ever grows, to the right and down
+            c.config(width=max(cw, round((x0 + w * 1.15) + x0)),
+                     height=max(ch, round((y0 + h * 1.15) + y0)))
+        c.delete('all')
+        card_outline(c, x0, y0, x0 + w, y0 + h, CORNER_MM / MM_PER_IN * dh,
+                     CORNER_MM / MM_PER_IN * dv, fill=COLOR, width=2)
+        c.create_text(x0 + w / 2, y0 + h / 2, fill='#888', justify='center',
+                      text='put the card\'s top-left corner on the outline\'s corner,\n'
+                           'then match the right and bottom edges')
+
+        e = m.get('effective_dpi')
+        lines = [m['output'] + (f"  {m['name']}" if m.get('name') else ''),
+                 f"EDID     {f'{e[0]:.1f} × {e[1]:.1f} dpi' if e else 'no physical size'}",
+                 f'now      {dh:.1f} × {dv:.1f} dpi']
+        if e:
+            lines[-1] += f'   ({dh / e[0] - 1:+.1%} / {dv / e[1] - 1:+.1%} vs EDID)'
+        if m.get('dpr'):
+            lines.append(f"CSS ppi  {(dh + dv) / 2 / m['dpr']:.1f}   (DPR {m['dpr']:g})")
+        lines.append(f"source   {s['source']}" + ('  (not saved)' if s['dirty'] else ''))
+        self.info.config(text='\n'.join(lines))
+
+        warn = []
+        if self.spans:
+            warn.append('the window spans two monitors: move it fully onto one')
+        if abs(dh / dv - 1) > TOLERANCE:
+            warn.append(f'width and height disagree by {abs(dh / dv - 1):.1%}: '
+                        'is the card flat and square to the screen?')
+        if e and max(abs(dh / e[0] - 1), abs(dv / e[1] - 1)) > TOLERANCE:
+            warn.append(f'more than {TOLERANCE:.1%} from the EDID: '
+                        'its size is probably rounded or wrong')
+        self.warn.config(text='\n'.join('⚠ ' + w for w in warn))
+
+    def save(self):
+        m, s = self.mon, self.cur()
+        rec = {'output': m['output'], 'maker': m.get('maker'), 'name': m.get('name'),
+               'effective_dpi': [round(v, 2) for v in s['dpi']],
+               'drawn_px': m['drawn_px'],      # the size holds even if the scaling changes:
+               'size_mm': [round(px / d * MM_PER_IN, 1) for px, d in zip(m['drawn_px'], s['dpi'])],
+               'edid_dpi': m.get('effective_dpi'), 'dpr': m.get('dpr'),
+               'saved': datetime.datetime.now().isoformat(timespec='seconds')}
+        self.cal[key(m)] = rec
+        save_cal(self.cal)
+        print(json.dumps(rec, ensure_ascii=False), flush=True)
+        s['source'], s['dirty'] = f"saved calibration ({rec['saved'][:10]})", False
+        self.redraw()
+
+    def quit(self):
+        dirty = [k.split('|')[0] for k, s in self.state.items() if s['dirty']]
+        if dirty and not messagebox.askokcancel(
+                'Unsaved calibration', f"Not saved: {', '.join(dirty)}. Quit anyway?"):
+            return
+        self.root.destroy()
+
+
+def main():
+    argparse.ArgumentParser(
+        description='Fine-tune the effective DPI against a real bank card (X11, or XWayland '
+                    'on Wayland). '
+                    f'Calibrations are saved per monitor in {CAL_FILE}.').parse_args()
+    rows = effective_dpi_rows()
+    root = tk.Tk()
+    dpr = rows[0].get('dpr')
+    if dpr:                                 # UI text at the desktop's scale; the card is in px
+        root.tk.call('tk', 'scaling', dpr * 96 / 72)
+    for name in ('TkDefaultFont', 'TkTextFont', 'TkFixedFont'):
+        tkfont.nametofont(name).configure(size=10)
+    Calibrator(root, rows)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()

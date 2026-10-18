@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""effective-dpi: device pixels per real inch of a monitor (X11: xrandr; GNOME Wayland: Mutter).
+
+effective DPI = the pixels drawn for the monitor / its physical size.
+X11: the monitor's area in the X screen (CRTC geometry); every X11 application, the browser
+included, draws into exactly those pixels.
+Wayland: it depends on the client. A native client with fractional scaling draws the panel
+pixels, one without draws ceil(scale) × the logical size, an XWayland client draws what
+XWayland's xrandr shows. The default is the first; --client picks another.
+The physical size comes from --size-mm, else a card calibration saved by
+effective-dpi-calibrate, else the EDID.
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+MM_PER_IN = 25.4
+TOLERANCE = 0.025                           # beyond this the EDID size is wrong, not rounded
+CAL_FILE = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+                        'effective-dpi', 'calibration.json')
+
+OUT_RE = re.compile(
+    r'^(\S+) connected( primary)? (\d+)x(\d+)\+(-?\d+)\+(-?\d+)'
+    r'(?: \(0x[0-9a-f]+\))?(?: (normal|left|inverted|right))?')
+MM_RE = re.compile(r'(\d+)mm x (\d+)mm\s*$')
+MODE_RE = re.compile(r'^\s+(\d+)x(\d+)i?\s+\(0x[0-9a-f]+\)\s+[\d.]+MHz(.*)$')
+HEX_RE = re.compile(r'^\s+([0-9a-f]{32})\s*$')
+TRANSFORMS = ('normal', 'left', 'inverted', 'right')     # Mutter 0-3; 4-7 are the same, flipped
+CLIENTS = {
+    'native': 'native Wayland with fractional scaling: draws the panel pixels',
+    'integer': 'native Wayland without fractional scaling: integer scale, then downscaled',
+    'xwayland': 'X11 application under XWayland',
+}
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def parse_xrandr(text):
+    """Active outputs from `xrandr --verbose`: geometry, rotation, mm, modes, EDID hex."""
+    mons, cur, in_edid = [], None, False
+    for line in text.splitlines():
+        if not line[:1].isspace():          # an output header (or "Screen 0:")
+            in_edid, cur = False, None
+            m = OUT_RE.match(line)
+            if m:                           # connected AND active (has a geometry)
+                mm = MM_RE.search(line)
+                cur = {
+                    'name': m.group(1),
+                    'primary': bool(m.group(2)),
+                    'geom': tuple(int(g) for g in m.group(3, 4, 5, 6)),  # w, h, x, y
+                    'rotation': m.group(7) or 'normal',
+                    'mm': (int(mm.group(1)), int(mm.group(2))) if mm else (0, 0),
+                    'mode': None, 'preferred': None, 'edid': '',
+                }
+                mons.append(cur)
+            continue
+        if cur is None:
+            continue
+        if line.strip() == 'EDID:':
+            in_edid = True
+            continue
+        if in_edid:
+            h = HEX_RE.match(line)
+            if h:
+                cur['edid'] += h.group(1)
+                continue
+            in_edid = False
+        m = MODE_RE.match(line)
+        if m:
+            size, flags = (int(m.group(1)), int(m.group(2))), m.group(3)
+            if '*current' in flags:
+                cur['mode'] = size
+            if '+preferred' in flags and not cur['preferred']:
+                cur['preferred'] = size
+    return mons
+
+
+def edid_info(hexstr):
+    """Maker id, product name, serial and size from the 128-byte EDID base block."""
+    if len(hexstr) < 256:
+        return {}
+    b = bytes.fromhex(hexstr[:256])
+    v = (b[8] << 8) | b[9]
+    serial = int.from_bytes(b[12:16], 'little')
+    info = {'maker': ''.join(chr(((v >> s) & 0x1F) + 64) for s in (10, 5, 0)),
+            'product': f'0x{b[10] | b[11] << 8:04x}', 'serial': f'0x{serial:08x}' if serial else '',
+            'size_cm': (b[21], b[22])}
+    if b[54] or b[55]:                      # the first descriptor is a detailed timing, in mm
+        info['dtd_mm'] = (b[66] | (b[68] & 0xF0) << 4, b[67] | (b[68] & 0x0F) << 8)
+    for off in (54, 72, 90, 108):           # the four 18-byte descriptors
+        d = b[off:off + 18]
+        text = d[5:18].split(b'\n')[0].decode('ascii', 'replace').strip()
+        if d[0] == 0 and d[1] == 0 and d[3] == 0xFC:   # display product name
+            info['name'] = text
+        if d[0] == 0 and d[1] == 0 and d[3] == 0xFF and text:   # product serial, as text
+            info['serial'] = text
+    return info
+
+
+def sysfs_edids():
+    """EDID hex of every connected DRM connector (readable without root)."""
+    out = []
+    for p in sorted(glob.glob('/sys/class/drm/card*-*/edid')):
+        try:
+            with open(p, 'rb') as f:
+                data = f.read()
+        except OSError:
+            continue
+        if len(data) >= 128:
+            out.append(data.hex())
+    return out
+
+
+def match_edid(vendor, product, serial, edids):
+    """The EDID of a Mutter monitor, matched by identity (sysfs and Mutter name ports differently)."""
+    same = [(h, e) for h, e in ((h, edid_info(h)) for h in edids)
+            if (e.get('maker'), e.get('name') or e.get('product')) == (vendor, product)]
+    exact = [h for h, e in same if e.get('serial') == serial]
+    return (exact or [h for h, _ in same if len(same) == 1] or [''])[0]
+
+
+def parse_mutter(data, edids):
+    """Active monitors from Mutter's GetCurrentState (busctl JSON), shaped like parse_xrandr's.
+
+    geom is the panel in pixels at the logical monitor's position (layout coordinates); scale
+    is the logical monitor's scale."""
+    _, monitors, logical, _ = data
+    found = {}
+    for spec, modes, _ in monitors:
+        found[tuple(spec)] = [next(((md[1], md[2]) for md in modes
+                                    if md[6].get(k, {}).get('data')), None)
+                              for k in ('is-current', 'is-preferred')]
+    mons = []
+    for x, y, scale, transform, primary, specs, _ in logical:
+        for spec in specs:
+            mode, pref = found.get(tuple(spec), (None, None))
+            if not mode:
+                continue
+            w, h = (mode[1], mode[0]) if transform % 2 else mode
+            edid = match_edid(*spec[1:], edids)
+            e = edid_info(edid)
+            mm = e.get('dtd_mm') or tuple(10 * c for c in e.get('size_cm', (0, 0)))
+            mons.append({'name': spec[0], 'primary': primary, 'geom': (w, h, x, y),
+                         'rotation': TRANSFORMS[transform % 4], 'mm': mm, 'mode': mode,
+                         'preferred': pref, 'edid': edid, 'scale': scale})
+    return mons
+
+
+def wayland_clients(m, xwayland, xwayland_dpr):
+    """What each kind of Wayland client draws on monitor m: {client: (geom, dpr)}."""
+    w, h, x, y = m['geom']
+    s = m['scale']
+    cases = {'native': ((w, h, x, y), s)}
+    if s != int(s):
+        k = math.ceil(s)
+        cases['integer'] = ((round(w * k / s), round(h * k / s), x, y), k)
+    if m['name'] in xwayland:               # XWayland's own view of the output
+        cases['xwayland'] = (xwayland[m['name']]['geom'], xwayland_dpr)
+    return cases
+
+
+def load_calibration():
+    """Card calibrations saved by effective-dpi-calibrate, keyed by output|maker|name."""
+    try:
+        with open(CAL_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def ui_scale():
+    """GNOME/X11 UI scale = Xft.dpi / 96, the browser's devicePixelRatio at 100% zoom."""
+    out = run(['xrdb', '-query']) or ''
+    m = re.search(r'^Xft\.dpi:\s*([\d.]+)', out, re.M)
+    return (float(m.group(1)) / 96, f'Xft.dpi {m.group(1)}') if m else (None, None)
+
+
+def pointer():
+    out = run(['xdotool', 'getmouselocation', '--shell']) or ''
+    kv = dict(l.split('=', 1) for l in out.splitlines() if '=' in l)
+    try:
+        return int(kv['X']), int(kv['Y'])
+    except (KeyError, ValueError):
+        return None
+
+
+def contains(m, p):
+    w, h, x, y = m['geom']
+    return x <= p[0] < x + w and y <= p[1] < y + h
+
+
+def oriented(w, h, gw, gh):
+    """Swap a landscape size for a rotated output, to match the drawn orientation."""
+    return (h, w) if w and h and (gw >= gh) != (w >= h) else (w, h)
+
+
+def calibrated_size(c, edid_mm, gw, gh):
+    """The glass size from an old calibration record without size_mm."""
+    d = c['effective_dpi']
+    if c.get('drawn_px'):                   # the surface the card was measured on
+        return tuple(px / v * MM_PER_IN for px, v in zip(c['drawn_px'], d))
+    if c.get('edid_dpi') and all(edid_mm):  # EDID mm × EDID dpi / card dpi: no pixels needed
+        return tuple(mm * e / v for mm, e, v in zip(edid_mm, c['edid_dpi'], d))
+    return gw / d[0] * MM_PER_IN, gh / d[1] * MM_PER_IN   # right only if the scaling is the same
+
+
+def describe(m, dpr, cm, size_mm=None, cal=None):
+    gw, gh, gx, gy = m['geom']
+    edid_mm = oriented(*m['mm'], gw, gh)
+    mode = m['mode'] or m['preferred']
+    if mode:
+        mode = oriented(*mode, gw, gh)
+    e = edid_info(m['edid'])
+    c = (cal or {}).get('|'.join((m['name'], e.get('maker') or '', e.get('name') or '')))
+    if size_mm:
+        (mw, mh), source = oriented(*size_mm, gw, gh), '--size-mm'
+    elif c:                                 # the card measured the real size of the glass
+        mw, mh = c.get('size_mm') or calibrated_size(c, edid_mm, gw, gh)
+        source = f"card calibration {c['saved'][:10]}"
+    else:
+        (mw, mh), source = edid_mm, 'EDID'
+    r = {'output': m['name'], 'primary': m['primary'], 'name': e.get('name'),
+         'maker': e.get('maker'), 'drawn_px': [gw, gh], 'position': [gx, gy],
+         'panel_px': list(mode) if mode else None, 'size_mm': [round(mw, 1), round(mh, 1)],
+         'size_source': source, 'warnings': []}
+    if not (mw and mh):
+        r['warnings'].append('the monitor reports no physical size (TV, projector, adapter?): '
+                             'measure it with a ruler or a bank card')
+        return r
+    diag = math.hypot(mw, mh) / MM_PER_IN
+    r['diagonal_in'] = round(diag, 2)
+    if not 7 <= diag <= 120:
+        r['warnings'].append(f'a {diag:.1f}-inch diagonal is implausible: the size is probably wrong')
+    if source == 'EDID' and mw % 10 == 0 and mh % 10 == 0:
+        r['warnings'].append('the size is in whole centimetres, so it may be rounded '
+                             '(up to ±0.5 cm, about ±1%)')
+    win, hin = mw / MM_PER_IN, mh / MM_PER_IN
+    eff_h, eff_v = gw / win, gh / hin
+    r['effective_dpi'] = [round(eff_h, 1), round(eff_v, 1)]
+    if source != 'EDID' and all(edid_mm):
+        edid_h = gw / (edid_mm[0] / MM_PER_IN)
+        r['edid_size_mm'] = list(edid_mm)
+        r['edid_dpi'] = [round(edid_h, 1), round(gh / (edid_mm[1] / MM_PER_IN), 1)]
+        off = edid_h / eff_h - 1
+        if abs(off) > TOLERANCE:
+            r['warnings'].append(f"with the EDID size everything would come out {abs(off):.1%} "
+                                 f"too {'large' if off > 0 else 'small'}: "
+                                 'the EDID is wrong for this monitor')
+    if mode:
+        r['panel_ppi'] = round(mode[0] / win, 1)
+        r['scale'] = round(gw / mode[0], 3)
+    if dpr:
+        eff = (eff_h + eff_v) / 2
+        r['dpr'] = dpr
+        r['css_ppi'] = round(eff / dpr, 1)
+        r['example'] = {'cm': cm, 'css_px': round(cm / 2.54 * eff / dpr, 1),
+                        'device_px': round(cm / 2.54 * eff)}
+    return r
+
+
+def print_row(r, how, dpr_src):
+    def line(k, v):
+        print(f'  {k:<16}{v}')
+    head = r['output'] + (f"  {r['name']}" if r.get('name') else '')
+    head += '  [primary]' if r['primary'] else ''
+    print(head + (f'  ({how})' if how else ''))
+    if 'effective_dpi' in r:
+        w, h = r['size_mm']
+        line('physical size', f"{w:g} × {h:g} mm  ({r['diagonal_in']:.1f}″ diagonal, "
+                              f"{r['size_source']})")
+        if 'edid_size_mm' in r:
+            (ew, eh), (dh, dv) = r['edid_size_mm'], r['edid_dpi']
+            line('EDID size', f'{ew} × {eh} mm  (with it: {dh}' + (f' × {dv}' if dh != dv else '') + ' dpi)')
+        if r['panel_px']:
+            pw, ph = r['panel_px']
+            line('panel', f"{pw} × {ph} px → {r['panel_ppi']} ppi")
+        if 'client' in r:
+            line('Wayland scale', f"{r['wayland_scale']:g}")
+            line('client', CLIENTS[r['client']])
+        dw, dh = r['drawn_px']
+        note = ''
+        s = r.get('scale')
+        if s and abs(s - 1) > 0.001:
+            note = (f"  (×{s:g} of the panel: drawn larger, then downscaled)" if s > 1 else
+                    f"  (×{s:g} of the panel: drawn smaller, then upscaled)")
+        line('drawn surface', f'{dw} × {dh} px{note}')
+        eh, ev = r['effective_dpi']
+        line('effective DPI', f'{eh}' if abs(eh - ev) / eh < 0.005
+             else f'{eh} horizontal, {ev} vertical')
+        if 'css_ppi' in r:
+            line('DPR', f"{r['dpr']:g}  ({dpr_src}; the browser at 100% zoom)")
+            line('CSS ppi', r['css_ppi'])
+            ex = r['example']
+            line(f"{ex['cm']:g} cm", f"= {ex['css_px']} CSS px = {ex['device_px']} device px")
+        for i, o in enumerate(r.get('other_clients', [])):
+            (ow, oh), od = o['drawn_px'], o['effective_dpi'][0]
+            line('other clients' if i == 0 else '',
+                 f"{o['client']}: {ow} × {oh} px → {od} DPI"
+                 + (f", DPR {o['dpr']:g}, CSS ppi {o['css_ppi']}" if 'css_ppi' in o else '')
+                 + f"  (--client {o['client']})")
+    for msg in r['warnings']:
+        print(f'  ⚠ {msg}')
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Effective DPI (device pixels per real inch) of a monitor, from xrandr + EDID '
+                    '(X11) or Mutter + EDID (GNOME Wayland).')
+    ap.add_argument('--all', action='store_true', help='every active monitor')
+    ap.add_argument('--output', help='one output by name, e.g. HDMI-2')
+    ap.add_argument('--client', choices=CLIENTS, default='native',
+                    help='Wayland only: which kind of client draws (default native); '
+                         'ignored on X11, where every client is an X client')
+    ap.add_argument('--dpr', type=float,
+                    help='devicePixelRatio to assume (default: Xft.dpi / 96; Wayland: the scale)')
+    ap.add_argument('--cm', type=float, default=10, help='length of the worked example (default 10)')
+    ap.add_argument('--size-mm', metavar='WxH',
+                    help='the real physical size, e.g. 527x296 (needs --output); '
+                         'overrides the EDID and any calibration')
+    ap.add_argument('--no-calibration', action='store_true',
+                    help='ignore card calibrations saved by effective-dpi-calibrate')
+    ap.add_argument('--json', action='store_true', help='machine-readable output')
+    a = ap.parse_args()
+    size_mm = None
+    if a.size_mm:
+        s = re.fullmatch(r'(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)', a.size_mm)
+        if not s:
+            ap.error('--size-mm takes WxH in millimetres, e.g. 527x296')
+        if not a.output:
+            ap.error('--size-mm needs --output: the size belongs to one monitor')
+        size_mm = (float(s.group(1)), float(s.group(2)))
+
+    wayland = os.environ.get('XDG_SESSION_TYPE') == 'wayland'
+    if wayland:
+        out = run(['busctl', '--user', '--json=short', 'call', 'org.gnome.Mutter.DisplayConfig',
+                   '/org/gnome/Mutter/DisplayConfig', 'org.gnome.Mutter.DisplayConfig',
+                   'GetCurrentState'])
+        if out is None:
+            sys.exit('effective-dpi: Wayland session, but no GNOME Mutter DisplayConfig over '
+                     'D-Bus (only GNOME is supported on Wayland; busctl from systemd)')
+        mons = parse_mutter(json.loads(out)['data'], sysfs_edids())
+    else:
+        text = run(['xrandr', '--verbose'])
+        if text is None:
+            sys.exit('effective-dpi: xrandr failed (no X display? package x11-xserver-utils)')
+        mons = parse_xrandr(text)
+    if not mons:
+        sys.exit('effective-dpi: no active monitor found')
+
+    how = None
+    if a.output:
+        mons = [m for m in mons if m['name'] == a.output]
+        if not mons:
+            sys.exit(f'effective-dpi: no active output named {a.output}')
+    elif not a.all and wayland:             # a Wayland client cannot see the pointer
+        mons = [m for m in mons if m['primary']][:1] or mons[:1]
+        how = 'primary: Wayland gives no pointer position; --all or --output for the others'
+    elif not a.all:
+        p = pointer()
+        pick = [m for m in mons if p and contains(m, p)]
+        how = 'under the pointer'
+        if not pick:
+            pick = [m for m in mons if m['primary']] or mons[:1]
+            how = 'primary: xdotool missing or pointer off-screen'
+        mons = pick[:1]
+
+    cal = {} if a.no_calibration else load_calibration()
+    rows, srcs = [], []
+    if wayland:
+        xw = run(['xrandr', '--verbose'])
+        xwayland = {m['name']: m for m in parse_xrandr(xw or '')}
+        xdpr, xsrc = ui_scale()
+        names = {'native': 'Wayland scale', 'integer': 'integer buffer scale',
+                 'xwayland': f'XWayland {xsrc}'}
+        for m in mons:
+            cases = wayland_clients(m, xwayland, xdpr)
+            client = a.client if a.client in cases else ('native' if a.client == 'integer' else None)
+            if not client:
+                sys.exit(f'effective-dpi: {m["name"]} not found in XWayland (xrandr failed?)')
+            out = []
+            for c, (geom, dpr) in cases.items():
+                r = describe(dict(m, geom=geom), (a.dpr if c == client else None) or dpr,
+                             a.cm, size_mm, cal)
+                r.update(session='wayland', client=c, wayland_scale=m['scale'])
+                out.append(r)
+            r = next(r for r in out if r['client'] == client)
+            r['other_clients'] = [{k: o[k] for k in ('client', 'drawn_px', 'position',
+                                                       'effective_dpi', 'dpr', 'css_ppi') if k in o}
+                                  for o in out if o is not r and 'effective_dpi' in o]
+            rows.append(r)
+            srcs.append('--dpr' if a.dpr else names[client])
+    else:
+        dpr, dpr_src = (a.dpr, '--dpr') if a.dpr else ui_scale()
+        for m in mons:
+            rows.append(dict(describe(m, dpr, a.cm, size_mm, cal), session='x11'))
+            srcs.append(dpr_src)
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    for r, dpr_src in zip(rows, srcs):
+        print_row(r, how, dpr_src)
+
+
+if __name__ == '__main__':
+    main()
