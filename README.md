@@ -10,6 +10,10 @@ because the size the monitor reports about itself can be wrong.
 
 Python 3, standard library only, one file each. No build, no install, no root.
 
+The background (why the web gave up on real centimetres, how scaling and wrong EDIDs break the
+size, and what a photo or PDF must carry for a true 1:1) is in the article
+[A document at physical size on screen: on the web and in Linux](https://maistrelis.com/en/articles/eggrafo-se-fysiko-megethos-stin-othoni/).
+
 ## The idea
 
 ```
@@ -111,7 +115,10 @@ HDMI-2  LG IPS FULLHD  [primary]
 ```
 
 With the EDID size, "10 cm" would have been drawn as 400 px, which is 10.9 cm on this glass.
-Nothing in the EDID gives this away; only a card or the spec sheet does.
+Nothing in the EDID gives this away; only a card or the spec sheet does. The same monitor,
+measured every way (EDID, spec sheet, card, diagonal, ruler), and the 127 units of this model in
+[linuxhw/EDID](https://github.com/linuxhw/EDID) that all report the same wrong size:
+[Two monitors: the measurements in detail](https://maistrelis.com/en/articles/eggrafo-se-fysiko-megethos-stin-othoni/dyo-othones/).
 
 On Wayland the output adds the monitor's scale, the client case it describes, and the other
 cases. For the 2560 × 1440 panel at 125% from the table above:
